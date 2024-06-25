@@ -114,7 +114,6 @@ func TestSimplePubSub(t *testing.T) {
 		t.Fatal("error creating publisher", err)
 	}
 	publisher.NotifyPublish(func(p Confirmation) {
-		return
 	})
 	defer publisher.Close()
 
