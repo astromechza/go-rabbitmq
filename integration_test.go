@@ -3,7 +3,6 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,7 +13,7 @@ import (
 const enableDockerIntegrationTestsFlag = `ENABLE_DOCKER_INTEGRATION_TESTS`
 
 func prepareDockerTest(t *testing.T) (connStr string) {
-	if v, ok := os.LookupEnv(enableDockerIntegrationTestsFlag); ok && strings.ToUpper(v) != "TRUE" {
+	if v, ok := os.LookupEnv(enableDockerIntegrationTestsFlag); !ok || strings.ToUpper(v) != "TRUE" {
 		t.Skipf("integration tests are only run if '%s' is TRUE", enableDockerIntegrationTestsFlag)
 		return
 	}
@@ -27,7 +26,6 @@ func prepareDockerTest(t *testing.T) (connStr string) {
 		t.Fatalf("error launching rabbitmq in docker: %v", err)
 	}
 	t.Cleanup(func() {
-		t.Log("hi")
 		containerId := strings.TrimSpace(string(out))
 		t.Logf("attempting to shutdown container '%s'", containerId)
 		if err := exec.Command("docker", "rm", "--force", containerId).Run(); err != nil {
@@ -37,7 +35,7 @@ func prepareDockerTest(t *testing.T) (connStr string) {
 	return "amqp://guest:guest@localhost:5672/"
 }
 
-func waitForHealthyAmqp(t *testing.T, connStr string) {
+func waitForHealthyAmqp(t *testing.T, connStr string) *Conn {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	tkr := time.NewTicker(time.Second)
@@ -46,52 +44,62 @@ func waitForHealthyAmqp(t *testing.T, connStr string) {
 		select {
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for healthy amqp", ctx.Err())
+			return nil
 		case <-tkr.C:
-			if err := func() error {
-				t.Log("attempting connection")
-				conn, err := NewConn(connStr)
-				if err != nil {
-					return fmt.Errorf("failed to setup connection: %v", err)
-				}
-				defer conn.Close()
-
-				pub, err := NewPublisher(conn)
-				if err != nil {
-					return fmt.Errorf("failed to setup publisher: %v", err)
-				}
-
-				t.Log("attempting publish")
-				return pub.PublishWithContext(ctx, []byte{}, []string{"ping"}, WithPublishOptionsExchange(""))
-			}(); err != nil {
-				t.Log("publish ping failed", err.Error())
+			conn, err := NewConn(connStr, WithConnectionOptionsLogger(simpleLogF(t.Logf)))
+			if err != nil {
+				t.Log("failed to connect", err.Error())
 			} else {
-				t.Log("ping successful")
-				return
+				if err := func() error {
+					t.Log("attempting connection")
+
+					pub, err := NewPublisher(conn, WithPublisherOptionsLogger(simpleLogF(t.Logf)))
+					if err != nil {
+						return fmt.Errorf("failed to setup publisher: %v", err)
+					}
+
+					t.Log("attempting publish")
+					return pub.PublishWithContext(ctx, []byte{}, []string{"ping"}, WithPublishOptionsExchange(""))
+				}(); err != nil {
+					_ = conn.Close()
+					t.Log("publish ping failed", err.Error())
+				} else {
+					t.Log("ping successful")
+					return conn
+				}
 			}
 		}
 	}
 }
 
+// TestSimplePubSub is an integration testing function that validates whether we can reliably connect to a docker-based
+// rabbitmq and consumer a message that we publish. This uses the default direct exchange with lots of error checking
+// to ensure the result is as expected.
 func TestSimplePubSub(t *testing.T) {
 	connStr := prepareDockerTest(t)
-	waitForHealthyAmqp(t, connStr)
-
-	conn, err := NewConn(connStr)
-	if err != nil {
-		t.Fatal("error creating connection", err)
-	}
+	conn := waitForHealthyAmqp(t, connStr)
 	defer conn.Close()
 
 	t.Logf("new consumer")
-	consumer, err := NewConsumer(conn, "my_queue")
+	consumerQueue := "my_queue"
+	consumer, err := NewConsumer(conn, consumerQueue, WithConsumerOptionsLogger(simpleLogF(t.Logf)))
 	if err != nil {
 		t.Fatal("error creating consumer", err)
 	}
-	defer consumer.Close()
+	defer consumer.CloseWithContext(context.Background())
+
+	// Setup a consumer which pushes each of its consumed messages over the channel. If the channel is closed or full
+	// it does not block.
+	consumed := make(chan Delivery)
+	defer close(consumed)
 
 	go func() {
 		err = consumer.Run(func(d Delivery) Action {
-			log.Printf("consumed: %v", string(d.Body))
+			t.Log("consumed")
+			select {
+			case consumed <- d:
+			default:
+			}
 			return Ack
 		})
 		if err != nil {
@@ -99,31 +107,42 @@ func TestSimplePubSub(t *testing.T) {
 		}
 	}()
 
+	// Setup a publisher with notifications enabled
 	t.Logf("new publisher")
-	publisher, err := NewPublisher(conn)
+	publisher, err := NewPublisher(conn, WithPublisherOptionsLogger(simpleLogF(t.Logf)))
 	if err != nil {
 		t.Fatal("error creating publisher", err)
 	}
 	publisher.NotifyPublish(func(p Confirmation) {
 		return
 	})
+	defer publisher.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// For test stability we cannot rely on the fact that the consumer go routines are up and running before the
+	// publisher starts it's first publish attempt. For this reason we run the publisher in a loop every second and
+	// pass after we see the first message come through.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
-
-	t.Logf("new publish")
-	confirms, err := publisher.PublishWithDeferredConfirmWithContext(
-		ctx, []byte("example"), []string{"my_queue"},
-		WithPublishOptionsMandatory,
-	)
-	if err != nil {
-		t.Fatal("failed to publish", err)
-	}
-	for _, confirm := range confirms {
-		if _, err := confirm.WaitContext(ctx); err != nil {
-			t.Fatal("failed to wait for publish", err)
+	tkr := time.NewTicker(time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for pub sub", ctx.Err())
+		case <-tkr.C:
+			t.Logf("new publish")
+			confirms, err := publisher.PublishWithDeferredConfirmWithContext(ctx, []byte("example"), []string{consumerQueue})
+			if err != nil {
+				// publish should always succeed since we've verified the ping previously
+				t.Fatal("failed to publish", err)
+			}
+			for _, confirm := range confirms {
+				if _, err := confirm.WaitContext(ctx); err != nil {
+					t.Fatal("failed to wait for publish", err)
+				}
+			}
+		case d := <-consumed:
+			t.Logf("successfully saw message round trip: '%s'", string(d.Body))
+			return
 		}
 	}
-	t.Logf("success")
-
 }
