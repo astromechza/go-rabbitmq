@@ -46,18 +46,16 @@ func waitForHealthyAmqp(t *testing.T, connStr string) *Conn {
 			t.Fatal("timed out waiting for healthy amqp", ctx.Err())
 			return nil
 		case <-tkr.C:
+			t.Log("attempting connection")
 			conn, err := NewConn(connStr, WithConnectionOptionsLogger(simpleLogF(t.Logf)))
 			if err != nil {
 				t.Log("failed to connect", err.Error())
 			} else {
 				if err := func() error {
-					t.Log("attempting connection")
-
 					pub, err := NewPublisher(conn, WithPublisherOptionsLogger(simpleLogF(t.Logf)))
 					if err != nil {
 						return fmt.Errorf("failed to setup publisher: %v", err)
 					}
-
 					t.Log("attempting publish")
 					return pub.PublishWithContext(ctx, []byte{}, []string{"ping"}, WithPublishOptionsExchange(""))
 				}(); err != nil {
